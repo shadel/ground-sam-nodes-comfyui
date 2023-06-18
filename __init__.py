@@ -1,3 +1,3 @@
-from .MaskNodes import NODE_CLASS_MAPPINGS
+from .ShadelNodes import NODE_CLASS_MAPPINGS
 
 __all__ = ['NODE_CLASS_MAPPINGS']
