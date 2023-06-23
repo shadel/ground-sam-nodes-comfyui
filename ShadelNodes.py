@@ -9,10 +9,18 @@ import torchvision.transforms.functional as TF
 import torch.nn.functional as torchfn
 import subprocess
 import sys
+import folder_paths
 
 DELIMITER = '|'
-cached_clipseg_model = None
+cached_groundingDINO_model = None
 VERY_BIG_SIZE = 1024 * 1024
+device = "cuda" if torch.cuda.is_available() else "cpu"
+groundingdino_config_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), "./GroundingDINO_SwinT_OGC.py")
+CATEGORY_NAME = "Shadel Nodes"
+FOLDER_NAME = "grounding-dino"
+model_path = folder_paths.models_dir
+
+folder_paths.folder_names_and_paths[FOLDER_NAME] = ([os.path.join(model_path, FOLDER_NAME)], folder_paths.supported_pt_extensions)
 
 package_list = None
 def update_package_list():
@@ -32,81 +40,74 @@ def ensure_package(package_name, import_path):
         subprocess.check_call([sys.executable, '-m', 'pip', '-q', 'install', import_path])
         update_package_list()
 
-def tensor2mask(t: torch.Tensor) -> torch.Tensor:
-    size = t.size()
-    if (len(size) < 4):
-        return t
-    if size[3] == 1:
-        return t[:,:,:,0]
-    elif size[3] == 4:
-        # Not sure what the right thing to do here is. Going to try to be a little smart and use alpha unless all alpha is 1 in case we'll fallback to RGB behavior
-        if torch.min(t[:, :, :, 3]).item() != 1.:
-            return t[:,:,:,3]
+def prompt2mask(grounding_model, sam_predictor, original_image, caption, box_threshold=0.25, text_threshold=0.25, num_boxes=2):
+    
+    import groundingdino.datasets.transforms as T
+    from groundingdino.util.inference import  predict
+    from segment_anything.utils.amg import remove_small_regions
+    
+    def image_transform_grounding(init_image):
+        transform = T.Compose([
+            T.RandomResize([800], max_size=1333),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        image, _ = transform(init_image, None)  # 3, h, w
+        return init_image, image
 
-    return TF.rgb_to_grayscale(tensor2rgb(t).permute(0,3,1,2), num_output_channels=1)[:,0,:,:]
+    image_np = np.array(original_image, dtype=np.uint8)
+    caption = caption.lower()
+    caption = caption.strip()
+    if not caption.endswith("."):
+        caption = caption + "."
+    _, image_tensor = image_transform_grounding(original_image)
+    boxes, logits, phrases = predict(grounding_model,
+                                     image_tensor, caption, box_threshold, text_threshold, device='cpu')
+    print(logits)
+    print('number of boxes: ', boxes.size(0))
+    # from PIL import Image, ImageDraw, ImageFont
+    H, W = original_image.size[1], original_image.size[0]
+    boxes = boxes * torch.Tensor([W, H, W, H])
+    boxes[:, :2] = boxes[:, :2] - boxes[:, 2:] / 2
+    boxes[:, 2:] = boxes[:, 2:] + boxes[:, :2]
 
-def tensor2rgb(t: torch.Tensor) -> torch.Tensor:
-    size = t.size()
-    if (len(size) < 4):
-        return t.unsqueeze(3).repeat(1, 1, 1, 3)
-    if size[3] == 1:
-        return t.repeat(1, 1, 1, 3)
-    elif size[3] == 4:
-        return t[:, :, :, :3]
-    else:
-        return t
+    final_m = torch.zeros((image_np.shape[0], image_np.shape[1]))
 
-def tensor2rgba(t: torch.Tensor) -> torch.Tensor:
-    size = t.size()
-    if (len(size) < 4):
-        return t.unsqueeze(3).repeat(1, 1, 1, 4)
-    elif size[3] == 1:
-        return t.repeat(1, 1, 1, 4)
-    elif size[3] == 3:
-        alpha_tensor = torch.ones((size[0], size[1], size[2], 1))
-        return torch.cat((t, alpha_tensor), dim=3)
-    else:
-        return t
+    if boxes.size(0) > 0:
+        sam_predictor.set_image(image_np)
 
-def tensor2batch(t: torch.Tensor, bs: torch.Size) -> torch.Tensor:
-    if len(t.size()) < len(bs):
-        t = t.unsqueeze(3)
-    if t.size()[0] < bs[0]:
-        t.repeat(bs[0], 1, 1, 1)
-    dim = bs[3]
-    if dim == 1:
-        return tensor2mask(t)
-    elif dim == 3:
-    elif dim == 4:
-        return tensor2rgba(t)
+        transformed_boxes = sam_predictor.transform.apply_boxes_torch(boxes, image_np.shape[:2])
+        masks, _, _ = sam_predictor.predict_torch(
+            point_coords=None,
+            point_labels=None,
+            boxes=transformed_boxes.to(device),
+            multimask_output=False,
+        )
 
-def tensors2common(t1: torch.Tensor, t2: torch.Tensor) -> (torch.Tensor, torch.Tensor):
-    t1s = t1.size()
-    t2s = t2.size()
-    if len(t1s) < len(t2s):
-        t1 = t1.unsqueeze(3)
-    elif len(t1s) > len(t2s):
-        t2 = t2.unsqueeze(3)
+        # remove small disconnected regions and holes
+        fine_masks = []
+        for mask in masks.to('cpu').numpy():  # masks: [num_masks, 1, h, w]
+            fine_masks.append(remove_small_regions(mask[0], 400, mode="holes")[0])
+        masks = np.stack(fine_masks, axis=0)[:, np.newaxis]
+        masks = torch.from_numpy(masks)
 
-    if len(t1.size()) == 3:
-        if t1s[0] < t2s[0]:
-            t1 = t1.repeat(t2s[0], 1, 1)
-        elif t1s[0] > t2s[0]:
-            t2 = t2.repeat(t1s[0], 1, 1)
-    else:
-        if t1s[0] < t2s[0]:
-            t1 = t1.repeat(t2s[0], 1, 1, 1)
-        elif t1s[0] > t2s[0]:
-            t2 = t2.repeat(t1s[0], 1, 1, 1)
+        num_obj = min(len(logits), num_boxes)
+        for obj_ind in range(num_obj):
+            # box = boxes[obj_ind]
 
-    t1s = t1.size()
-    t2s = t2.size()
-    if len(t1s) > 3 and t1s[3] < t2s[3]:
-        return tensor2batch(t1, t2s), t2
-    elif len(t1s) > 3 and t1s[3] > t2s[3]:
-        return t1, tensor2batch(t2, t1s)
-    else:
-        return t1, t2
+            m = masks[obj_ind][0]
+            final_m += m
+    final_m = (final_m > 0).to('cpu').numpy()
+    # print(final_m.max(), final_m.min())
+    return np.dstack((final_m, final_m, final_m)) * 255
+    
+
+
+def tensor2pil(image):
+    return Image.fromarray(np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+
+def pil2tensor(image):
+    return torch.from_numpy(np.array(image).astype(np.float32) / 255.0).unsqueeze(0)
 
 class GroundedSAMSegNode:
     def __init__(self):
@@ -116,83 +117,59 @@ class GroundedSAMSegNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "ground_model": ("GROUNDING_DINO_MODEL",),
+                "sam_model": ("SAM_MODEL",),
                 "image": ("IMAGE",),
                 "prompt": ("STRING", {"multiline": True}),
-                "negative_prompt": ("STRING", {"multiline": True}),
-                "precision": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "normalize": (["no", "yes"],),
+                "box_threshold": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "text_threshold": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "num_boxes": ("INT", {"default": 2, "min": 0, "max": 10, "step": 1}),
             },
         }
 
-    RETURN_TYPES = ("IMAGE","IMAGE",)
+    RETURN_TYPES = ("IMAGE",)
     FUNCTION = "get_mask"
 
-    CATEGORY = "Shadel Nodes"
+    CATEGORY = CATEGORY_NAME
 
-    def get_mask(self, image, prompt, negative_prompt, precision, normalize):
+    def get_mask(self, ground_model, sam_model, image, prompt, box_threshold, text_threshold, num_boxes):
 
-        model = self.load_model()
-        image = tensor2rgb(image)
-        B, H, W, _ = image.shape
-        # clipseg only works on square images, so we'll just use the larger dimension
-        # TODO - Should we pad instead of resize?
-        used_dim = max(W, H)
+        from segment_anything import SamPredictor
+        sam_predictor = SamPredictor(sam_model.to(device))
 
-        transform = transforms.Compose([
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            transforms.Resize((used_dim, used_dim), antialias=True) ])
-        img = transform(image.permute(0, 3, 1, 2))
+        input_image_pil = tensor2pil(image)
+        mask_image = prompt2mask(ground_model, sam_predictor, input_image_pil, prompt, box_threshold, text_threshold, num_boxes)
 
-        prompts = prompt.split(DELIMITER)
-        negative_prompts = negative_prompt.split(DELIMITER) if negative_prompt != '' else []
-        with torch.no_grad():
-            # Optimize me: Could do positive and negative prompts as part of one batch
-            dup_prompts = [item for item in prompts for _ in range(B)]
-            preds = model(img.repeat(len(prompts), 1, 1, 1), dup_prompts)[0]
-            dup_neg_prompts = [item for item in negative_prompts for _ in range(B)]
-            negative_preds = model(img.repeat(len(negative_prompts), 1, 1, 1), dup_neg_prompts)[0] if len(negative_prompts) > 0 else None
+        mask_image = pil2tensor(np.array(mask_image, dtype=np.uint8))
+        return (mask_image, )
 
-        preds = torch.nn.functional.interpolate(preds, size=(H, W), mode='nearest')
-        preds = torch.sigmoid(preds)
-        preds = preds.reshape(len(prompts), B, H, W)
-        mask = torch.max(preds, dim=0).values
+class GroundingDINOLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"model_name": (folder_paths.get_filename_list(FOLDER_NAME), )}}
 
-        if len(negative_prompts) > 0:
-            negative_preds = torch.nn.functional.interpolate(negative_preds, size=(H, W), mode='nearest')
-            negative_preds = torch.sigmoid(negative_preds)
-            negative_preds = negative_preds.reshape(len(negative_prompts), B, H, W)
-            mask_neg = torch.max(negative_preds, dim=0).values
-            mask = torch.min(mask, 1. - mask_neg)
+    RETURN_TYPES = ("GROUNDING_DINO_MODEL", )
+    FUNCTION = "load_model"
 
-        if normalize == "yes":
-            mask_min = torch.min(mask)
-            mask_max = torch.max(mask)
-            mask_range = mask_max - mask_min
-            mask = (mask - mask_min) / mask_range
-        thresholded = torch.where(mask >= precision, 1., 0.)
-        # import code
-        # code.interact(local=locals())
-        return (thresholded.to(device=image.device), mask.to(device=image.device),)
+    CATEGORY = CATEGORY_NAME
 
-    def load_model(self):
-        global cached_clipseg_model
-        if cached_clipseg_model == None:
-            ensure_package("clipseg", "clipseg@git+https://github.com/timojl/clipseg.git@bbc86cfbb7e6a47fb6dae47ba01d3e1c2d6158b0")
-            from clipseg.clipseg import CLIPDensePredT
-            model = CLIPDensePredT(version='ViT-B/16', reduce_dim=64, complex_trans_conv=True)
-            model.eval()
+    def load_model(self, model_name):
+        modelname = folder_paths.get_full_path(FOLDER_NAME, model_name)
 
-            d64_file = self.download_and_cache('rd64-uni-refined.pth', 'https://owncloud.gwdg.de/index.php/s/ioHbRzFx6th32hn/download?path=%2F&files=rd64-uni-refined.pth')
-            d16_file = self.download_and_cache('rd16-uni.pth', 'https://owncloud.gwdg.de/index.php/s/ioHbRzFx6th32hn/download?path=%2F&files=rd16-uni.pth')
+        print(f"Loads grounding-dino model: {modelname}")
+        global cached_groundingDINO_model
+        if cached_groundingDINO_model == None:
+            ensure_package("GroundingDINO", "git+https://github.com/IDEA-Research/GroundingDINO.git")
+
+            # d64_file = self.download_and_cache('groundingdino_swint_ogc.pth', 'https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth')
             # Use CUDA if it's available
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            model.load_state_dict(torch.load(d64_file, map_location=device), strict=False)
-            model = model.eval().to(device=device)
-            cached_clipseg_model = model
-        return cached_clipseg_model
+            model = self.load_groundingdino_model(groundingdino_config_file, modelname).to(device=device)
+            cached_groundingDINO_model = model
+        return (cached_groundingDINO_model, )
 
     def download_and_cache(self, cache_name, url):
-        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'download_cache')
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), FOLDER_NAME)
         os.makedirs(cache_dir, exist_ok=True)
 
         file_name = os.path.join(cache_dir, cache_name)
@@ -207,7 +184,23 @@ class GroundedSAMSegNode:
             print('Finished downloading.')
 
         return file_name
+    
+    def load_groundingdino_model(self, model_config_path, model_checkpoint_path):
+        from groundingdino.util.slconfig import SLConfig
+        from groundingdino.models import build_model
+        from groundingdino.util.utils import clean_state_dict
+
+        args = SLConfig.fromfile(model_config_path)
+        args.device = device
+        model = build_model(args)
+        checkpoint = torch.load(model_checkpoint_path, map_location="cpu")
+        load_res = model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
+        print(load_res)
+        _ = model.eval()
+        return model
+
 
 NODE_CLASS_MAPPINGS = {
-    "Mask By Text": GroundedSAMSegNode,
+    "Mask By Grounded SAM Text": GroundedSAMSegNode,
+    "GroundingDINOLoader": GroundingDINOLoader,
 }
