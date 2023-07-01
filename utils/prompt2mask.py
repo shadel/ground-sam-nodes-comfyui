@@ -1,4 +1,4 @@
-from utils.device import device
+from .device import device
 
 
 import numpy as np

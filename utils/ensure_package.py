@@ -1,7 +1,7 @@
 import subprocess
 import sys
 
-from utils.update_package_list import update_package_list, package_list
+from .update_package_list import update_package_list, package_list
 
 
 def ensure_package(package_name, import_path):

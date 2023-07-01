@@ -1,8 +1,8 @@
-from ShadelNodes import CATEGORY_NAME
-from utils.device import device
-from utils.pil2tensor import pil2tensor
-from utils.prompt2mask import prompt2mask
-from utils.tensor2pil import tensor2pil
+from ..config import CATEGORY_NAME
+from ..utils.device import device
+from ..utils.pil2tensor import pil2tensor
+from ..utils.prompt2mask import prompt2mask
+from ..utils.tensor2pil import tensor2pil
 
 
 import numpy as np

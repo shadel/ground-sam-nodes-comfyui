@@ -1,13 +1,22 @@
-from ShadelNodes import CATEGORY_NAME, FOLDER_NAME, cached_groundingDINO_model, groundingdino_config_file
-from utils.device import device
-from utils.ensure_package import ensure_package
+from ..config import CATEGORY_NAME
+from ..utils.device import device
+from ..utils.ensure_package import ensure_package
 
 
 import torch
 
 
 import os
+import folder_paths
 
+FOLDER_NAME = "grounding-dino"
+model_path = folder_paths.models_dir
+
+folder_paths.folder_names_and_paths[FOLDER_NAME] = ([os.path.join(model_path, FOLDER_NAME)], folder_paths.supported_pt_extensions)
+
+
+cached_groundingDINO_model = None
+groundingdino_config_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), "./GroundingDINO_SwinT_OGC.py")
 
 class GroundingDINOLoader:
     @classmethod
