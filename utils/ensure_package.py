@@ -1,8 +1,13 @@
 import subprocess
 import sys
 
-from .update_package_list import update_package_list, package_list
+package_list = None
+def update_package_list():
+    import sys
+    import subprocess
 
+    global package_list
+    package_list = [r.decode().split('==')[0] for r in subprocess.check_output([sys.executable, '-m', 'pip', 'freeze']).split()]
 
 def ensure_package(package_name, import_path):
     global package_list
