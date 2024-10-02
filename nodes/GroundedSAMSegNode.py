@@ -2,7 +2,7 @@ from ..config import CATEGORY_NAME
 from ..utils.device import device
 from ..utils.pil2tensor import pil2tensor
 from ..utils.prompt2mask import prompt2mask
-from ..utils.tensor2pil import tensor2pil
+from ..utils.tensor2pil import np2pil, img_np_to_tensor, img_tensor_to_np
 
 
 import numpy as np
@@ -35,9 +35,16 @@ class GroundedSAMSegNode:
 
         from segment_anything import SamPredictor
         sam_predictor = SamPredictor(sam_model.to(device))
+        
+        tensor_image_list = img_tensor_to_np(image)
+        out_list = []
 
-        input_image_pil = tensor2pil(image)
-        mask_image = prompt2mask(ground_model, sam_predictor, input_image_pil, prompt, box_threshold, text_threshold, num_boxes)
+        for tensor_image in tensor_image_list:
+            input_image_pil = np2pil(tensor_image)
+            mask_image = prompt2mask(ground_model, sam_predictor, input_image_pil, prompt, box_threshold, text_threshold, num_boxes)
+            # mask_image = pil2tensor(np.array(mask_image, dtype=np.uint8))
 
-        mask_image = pil2tensor(np.array(mask_image, dtype=np.uint8))
-        return (mask_image, )
+            out_list.append(mask_image)
+        
+
+        return (img_np_to_tensor(out_list), )
